@@ -1,0 +1,11 @@
+# Downloaded PDFs and local sync folders
+GoogleDrive_Sync/
+*.pdf
+_missing_papers.txt
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
