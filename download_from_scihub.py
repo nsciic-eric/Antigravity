@@ -94,13 +94,16 @@ def fetch_pdf_from_scihub(
 def fetch_pdf_from_unpaywall(
     session: requests.Session, email: str, doi: str
 ) -> Tuple[Optional[bytes], Optional[str]]:
-    """Sci-Hub 未命中时，自动回退 Unpaywall 尝试合法 OA 版本"""
+    """通过 Unpaywall 尝试获取合法 OA PDF"""
     if not email or email == "your_email@example.com":
         return None, None
     api_url = f"https://api.unpaywall.org/v2/{doi}?email={email}"
     try:
-        r = session.get(api_url, timeout=15).json()
-        oa_loc = r.get("best_oa_location") or {}
+        r = session.get(api_url, timeout=15)
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        oa_loc = data.get("best_oa_location") or {}
         pdf_url = oa_loc.get("url_for_pdf")
         if pdf_url:
             pdf_resp = session.get(pdf_url, timeout=30)
@@ -108,6 +111,62 @@ def fetch_pdf_from_unpaywall(
                 return pdf_resp.content, "Unpaywall OA"
     except Exception:
         pass
+    return None, None
+
+
+def fetch_pdf_from_openalex(
+    session: requests.Session, email: str, doi: str
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """通过 OpenAlex 尝试获取合法 OA PDF"""
+    params = {"mailto": email} if (email and email != "your_email@example.com") else {}
+    api_url = f"https://api.openalex.org/works/https://doi.org/{doi}"
+    try:
+        r = session.get(api_url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        best = data.get("best_oa_location") or {}
+        pdf_url = best.get("pdf_url") or (data.get("open_access") or {}).get("oa_url")
+        if pdf_url:
+            pdf_resp = session.get(pdf_url, timeout=30)
+            if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
+                return pdf_resp.content, "OpenAlex OA"
+    except Exception:
+        pass
+    return None, None
+
+
+def fetch_pdf_from_semanticscholar(
+    session: requests.Session, doi: str
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """通过 Semantic Scholar 尝试获取合法 OA PDF"""
+    api_url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=openAccessPdf"
+    try:
+        r = session.get(api_url, timeout=15)
+        if r.status_code != 200:
+            return None, None
+        oa_pdf = (r.json().get("openAccessPdf") or {}).get("url")
+        if oa_pdf:
+            pdf_resp = session.get(oa_pdf, timeout=30)
+            if pdf_resp.status_code == 200 and pdf_resp.content[:4] == b"%PDF":
+                return pdf_resp.content, "Semantic Scholar OA"
+    except Exception:
+        pass
+    return None, None
+
+
+def fetch_pdf_from_oa_sources(
+    session: requests.Session, email: str, doi: str
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """依次从合法 OA 源（Unpaywall / OpenAlex / Semantic Scholar）获取 PDF"""
+    for fetcher in (
+        lambda: fetch_pdf_from_unpaywall(session, email, doi),
+        lambda: fetch_pdf_from_openalex(session, email, doi),
+        lambda: fetch_pdf_from_semanticscholar(session, doi),
+    ):
+        content, source = fetcher()
+        if content and source:
+            return content, source
     return None, None
 
 
@@ -152,12 +211,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--email",
         default=UNPAYWALL_EMAIL,
-        help="用于 Unpaywall OA 自动回退的邮箱地址",
+        help="用于 Unpaywall / OpenAlex OA 自动回退的邮箱地址",
     )
     parser.add_argument(
         "--scihub-url",
         default=SCIHUB_URL,
         help=f"Sci-Hub 域名（默认：{SCIHUB_URL}）",
+    )
+    parser.add_argument(
+        "--oa-only",
+        action="store_true",
+        help="仅使用合法开放获取来源（Unpaywall / OpenAlex / Semantic Scholar），跳过 Sci-Hub",
     )
     parser.add_argument(
         "--metadata-file",
@@ -191,6 +255,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if "您的邮箱" in args.save_dir or "你的邮箱" in args.save_dir:
+        print(
+            "[警告] 检测到 --save-dir 中仍包含占位符“您的邮箱”！\n"
+            "       请先运行 `ls \"$HOME/Library/CloudStorage/\"` 查看真实文件夹名后再运行，否则不会同步到 Google Drive。"
+        )
+
     os.makedirs(args.save_dir, exist_ok=True)
 
     entries = load_entries(args.metadata_file, args.doi_file, args.only_priority)
@@ -198,10 +269,11 @@ def main() -> None:
     session.headers.update(HEADERS)
 
     if args.email == "your_email@example.com":
-        print("[提示] 未配置 --email，将跳过 Unpaywall OA 自动回退（建议传入真实邮箱以提高近3年论文命中率）。")
+        print("[提示] 未配置 --email，将跳过 Unpaywall OA（建议传入真实邮箱以提高 OA 命中率）。")
 
     missing = []
     success_count = 0
+    scihub_blocked = args.oa_only
 
     for rank, doi, title in entries:
         if not doi:
@@ -219,9 +291,19 @@ def main() -> None:
             continue
 
         try:
-            content, source = fetch_pdf_from_scihub(session, args.scihub_url, doi)
+            content, source = None, "未找到合法 OA 版本"
+
+            if not scihub_blocked:
+                content, source = fetch_pdf_from_scihub(session, args.scihub_url, doi)
+                if not content and "验证码" in source:
+                    scihub_blocked = True
+                    print(
+                        "[提示] Sci-Hub 触发人机验证码，已自动停止请求 Sci-Hub，"
+                        "后续篇目将仅通过合法 OA 源（Unpaywall / OpenAlex / Semantic Scholar）尝试获取。"
+                    )
+
             if not content:
-                oa_content, oa_source = fetch_pdf_from_unpaywall(session, args.email, doi)
+                oa_content, oa_source = fetch_pdf_from_oa_sources(session, args.email, doi)
                 if oa_content and oa_source:
                     content, source = oa_content, oa_source
 
